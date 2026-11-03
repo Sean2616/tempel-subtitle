@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Subtitle Merger Pro - Tanpa Turun Kualitas</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-slate-900 text-white min-h-screen flex items-center justify-center p-4">
+
+    <div class="bg-slate-800 p-8 rounded-2xl shadow-2xl max-w-lg w-full border border-slate-700">
+        <h1 class="text-2xl font-bold text-center mb-2 text-blue-400">🎬 Subtitle Merger Pro</h1>
+        <p class="text-slate-400 text-center text-sm mb-6">Tempel subtitle ke video secara online tanpa menurunkan kualitas.</p>
+
+        <form id="subForm" class="space-y-5">
+            <div>
+                <label class="block text-sm font-medium mb-2 text-slate-300">1. Pilih File Video (Maks 500MB)</label>
+                <input type="file" name="video" accept="video/mp4,video/x-matroska,video/*" required
+                    class="block w-full text-sm text-slate-400 file:mr-4 file:py-2.5 file:px-4 file:rounded-lg file:border-0 file:text-sm file:font-semibold file:bg-blue-600 file:text-white hover:file:bg-blue-700 cursor-pointer bg-slate-900 rounded-lg border border-slate-700">
+            </div>
+
+            <div>
+                <label class="block text-sm font-medium mb-2 text-slate-300">2. Pilih File Subtitle (.srt)</label>
+                <input type="file" name="subtitle" accept=".srt" required
+                    class="block w-full text-sm text-slate-400 file:mr-4 file:py-2.5 file:px-4 file:rounded-lg file:border-0 file:text-sm file:font-semibold file:bg-emerald-600 file:text-white hover:file:bg-emerald-700 cursor-pointer bg-slate-900 rounded-lg border border-slate-700">
+            </div>
+
+            <div>
+                <label class="block text-sm font-medium mb-2 text-slate-300">3. Pilih Metode</label>
+                <div class="space-y-3">
+                    <label class="flex items-start p-3 bg-slate-900 rounded-lg border border-slate-700 cursor-pointer hover:border-blue-500">
+                        <input type="radio" name="mode" value="soft" checked class="mt-1 mr-3 text-blue-600">
+                        <div>
+                            <span class="font-semibold text-sm text-blue-400 block">Soft Subtitle (100% Lossless / Instan)</span>
+                            <span class="text-xs text-slate-400">Tanpa render ulang. Kualitas 100% asli, selesai dalam 2 detik.</span>
+                        </div>
+                    </label>
+
+                    <label class="flex items-start p-3 bg-slate-900 rounded-lg border border-slate-700 cursor-pointer hover:border-blue-500">
+                        <input type="radio" name="mode" value="hard" class="mt-1 mr-3 text-blue-600">
+                        <div>
+                            <span class="font-semibold text-sm text-amber-400 block">Hard Subtitle / Permanen (Visually Lossless)</span>
+                            <span class="text-xs text-slate-400">Subtitle menyatu ke gambar video (CRF 17). Cocok untuk TikTok, Reels, YouTube.</span>
+                        </div>
+                    </label>
+                </div>
+            </div>
+
+            <button type="submit" id="submitBtn"
+                class="w-full py-3 px-4 bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-700 hover:to-indigo-700 rounded-lg font-semibold text-white shadow-lg transition duration-200">
+                Proses & Unduh Video
+            </button>
+        </form>
+
+        <!-- Kotak Progress Bar -->
+        <div id="statusBox" class="hidden mt-6 p-4 bg-slate-900 rounded-lg border border-slate-700">
+            <div class="flex justify-between text-xs text-slate-300 mb-2">
+                <span id="statusText">Mengunggah & memproses video...</span>
+                <span id="progressPercent" class="font-bold text-blue-400">0%</span>
+            </div>
+            <div class="w-full bg-slate-700 rounded-full h-3 overflow-hidden">
+                <div id="progressBar" class="bg-blue-500 h-3 rounded-full transition-all duration-300" style="width: 0%"></div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const form = document.getElementById('subForm');
+        const submitBtn = document.getElementById('submitBtn');
+        const statusBox = document.getElementById('statusBox');
+        const statusText = document.getElementById('statusText');
+        const progressBar = document.getElementById('progressBar');
+        const progressPercent = document.getElementById('progressPercent');
+
+        form.addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const formData = new FormData(form);
+
+            submitBtn.disabled = true;
+            submitBtn.classList.add('opacity-50', 'cursor-not-allowed');
+            statusBox.classList.remove('hidden');
+            statusText.textContent = "Mengunggah file ke server...";
+            progressBar.style.width = '5%';
+            progressPercent.textContent = '5%';
+
+            try {
+                const response = await fetch('/process', {
+                    method: 'POST',
+                    body: formData
+                });
+
+                const data = await response.json();
+                if (!response.ok) throw new Error(data.error || 'Gagal memulai proses.');
+
+                const jobId = data.jobId;
+                statusText.textContent = "Sedang menempelkan subtitle...";
+
+                // Cek status setiap 1 detik
+                const interval = setInterval(async () => {
+                    const resStatus = await fetch(`/status/${jobId}`);
+                    const statData = await resStatus.json();
+
+                    if (statData.status === 'processing') {
+                        const p = Math.max(5, statData.progress);
+                        progressBar.style.width = `${p}%`;
+                        progressPercent.textContent = `${p}%`;
+                    } else if (statData.status === 'done') {
+                        clearInterval(interval);
+                        progressBar.style.width = '100%';
+                        progressPercent.textContent = '100%';
+                        statusText.textContent = "✅ Selesai! Mengunduh video...";
+
+                        window.location.href = `/download/${jobId}`;
+
+                        setTimeout(() => {
+                            submitBtn.disabled = false;
+                            submitBtn.classList.remove('opacity-50', 'cursor-not-allowed');
+                        }, 2000);
+                    } else if (statData.status === 'error') {
+                        clearInterval(interval);
+                        alert(statData.error);
+                        statusBox.classList.add('hidden');
+                        submitBtn.disabled = false;
+                        submitBtn.classList.remove('opacity-50', 'cursor-not-allowed');
+                    }
+                }, 1000);
+
+            } catch (error) {
+                alert(error.message);
+                statusBox.classList.add('hidden');
+                submitBtn.disabled = false;
+                submitBtn.classList.remove('opacity-50', 'cursor-not-allowed');
+            }
+        });
+    </script>
+</body>
+</html>
