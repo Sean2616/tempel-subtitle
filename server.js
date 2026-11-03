@@ -12,7 +12,6 @@ const outputDir = 'outputs';
 if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir);
 if (!fs.existsSync(outputDir)) fs.mkdirSync(outputDir);
 
-// Konfigurasi Multer + Batas Ukuran File (Maksimal 500MB agar server aman)
 const storage = multer.diskStorage({
     destination: (req, file, cb) => cb(null, uploadDir),
     filename: (req, file, cb) => {
@@ -23,17 +22,27 @@ const storage = multer.diskStorage({
 
 const upload = multer({
     storage,
-    limits: { fileSize: 500 * 1024 * 1024 } // Limit 500 MB
+    limits: { fileSize: 500 * 1024 * 1024 } // Maksimal 500 MB
 });
 
 app.use(express.static('public'));
 
-// Penyimpanan status antrean proses (Job Queue)
 const jobs = {};
 
-// Fungsi bantu konversi waktu HH:MM:SS ke detik untuk hitung persentase
+// Konversi HH:MM:SS.ms ke total detik
 function timeToSeconds(h, m, s) {
-    return parseInt(h) * 3600 + parseInt(m) * 60 + parseFloat(s);
+    return parseInt(h, 10) * 3600 + parseInt(m, 10) * 60 + parseFloat(s);
+}
+
+// Konversi detik ke format MM:SS atau HH:MM:SS
+function formatSeconds(sec) {
+    if (!sec || sec < 0 || !isFinite(sec)) return 'Menghitung...';
+    const hrs = Math.floor(sec / 3600);
+    const mins = Math.floor((sec % 3600) / 60);
+    const secs = Math.floor(sec % 60);
+    if (hrs > 0) return `${hrs}j ${mins}m ${secs}d`;
+    if (mins > 0) return `${mins} menit ${secs} detik`;
+    return `${secs} detik`;
 }
 
 // 1. Endpoint Mulai Proses Video
@@ -51,11 +60,19 @@ app.post('/process', upload.fields([{ name: 'video', maxCount: 1 }, { name: 'sub
 
     jobs[jobId] = {
         status: 'processing',
+        mode: mode,
         progress: 0,
+        currentTimeStr: '00:00:00',
+        totalDurationStr: '00:00:00',
+        totalDuration: 0,
+        fps: '0',
+        speed: '0x',
+        eta: 'Menghitung...',
+        log: 'Menganalisis file video dan subtitle...',
         outputPath,
         outputFileName,
         error: null,
-        createdAt: Date.now()
+        startTime: Date.now()
     };
 
     let ffmpegArgs = [];
@@ -82,23 +99,55 @@ app.post('/process', upload.fields([{ name: 'video', maxCount: 1 }, { name: 'sub
     }
 
     const ffmpeg = spawn('ffmpeg', ffmpegArgs);
-    let totalDuration = 0;
+    let headerBuffer = '';
 
     ffmpeg.stderr.on('data', (data) => {
-        const log = data.toString();
+        const text = data.toString();
+        const job = jobs[jobId];
+        if (!job) return;
 
-        // Ambil total durasi video
-        const durMatch = log.match(/Duration:\s(\d{2}):(\d{2}):(\d{2}\.\d{2})/);
-        if (durMatch && !totalDuration) {
-            totalDuration = timeToSeconds(durMatch[1], durMatch[2], durMatch[3]);
+        // Simpan buffer awal untuk memastikan informasi Duration tidak terpotong
+        if (!job.totalDuration && headerBuffer.length < 20000) {
+            headerBuffer += text;
+            const durMatch = headerBuffer.match(/Duration:\s*(\d{2}):(\d{2}):(\d{2})\.(\d{2})/);
+            if (durMatch) {
+                job.totalDuration = timeToSeconds(durMatch[1], durMatch[2], `${durMatch[3]}.${durMatch[4]}`);
+                job.totalDurationStr = `${durMatch[1]}:${durMatch[2]}:${durMatch[3]}`;
+                job.log = `Durasi video terdeteksi: ${job.totalDurationStr}. Memulai proses tempel subtitle...`;
+            }
         }
 
-        // Ambil waktu berjalan untuk update progress bar
-        const timeMatch = log.match(/time=(\d{2}):(\d{2}):(\d{2}\.\d{2})/);
-        if (timeMatch && totalDuration > 0 && jobs[jobId]) {
-            const currentTime = timeToSeconds(timeMatch[1], timeMatch[2], timeMatch[3]);
-            const percent = Math.min(99, Math.round((currentTime / totalDuration) * 100));
-            jobs[jobId].progress = percent;
+        // Ambil update waktu terakhir dari chunk log FFmpeg
+        const timeMatches = [...text.matchAll(/time=(\d{2}):(\d{2}):(\d{2})\.(\d{2})/g)];
+        if (timeMatches.length > 0) {
+            const lastMatch = timeMatches[timeMatches.length - 1];
+            const h = lastMatch[1], m = lastMatch[2], s = lastMatch[3], ms = lastMatch[4];
+            const currentSec = timeToSeconds(h, m, `${s}.${ms}`);
+            job.currentTimeStr = `${h}:${m}:${s}`;
+
+            // Ambil FPS dan Speed jika ada
+            const fpsMatch = text.match(/fps=\s*([\d.]+)/);
+            const speedMatch = text.match(/speed=\s*([\d.]+x)/);
+            if (fpsMatch) job.fps = fpsMatch[1];
+            if (speedMatch) job.speed = speedMatch[1];
+
+            if (job.totalDuration > 0) {
+                const percent = Math.min(99, Math.max(1, Math.round((currentSec / job.totalDuration) * 100)));
+                job.progress = percent;
+
+                // Hitung Estimasi Sisa Waktu (ETA)
+                const speedVal = parseFloat(job.speed);
+                if (speedVal && speedVal > 0) {
+                    const remainingVideoSec = Math.max(0, job.totalDuration - currentSec);
+                    job.eta = formatSeconds(remainingVideoSec / speedVal);
+                } else {
+                    const elapsedSec = (Date.now() - job.startTime) / 1000;
+                    const estimatedTotalSec = (elapsedSec / percent) * 100;
+                    job.eta = formatSeconds(Math.max(0, estimatedTotalSec - elapsedSec));
+                }
+
+                job.log = `Memproses posisi ${job.currentTimeStr} dari ${job.totalDurationStr} (${job.fps} FPS | Kecepatan ${job.speed})`;
+            }
         }
     });
 
@@ -106,26 +155,41 @@ app.post('/process', upload.fields([{ name: 'video', maxCount: 1 }, { name: 'sub
         if (fs.existsSync(videoPath)) fs.unlinkSync(videoPath);
         if (fs.existsSync(subPath)) fs.unlinkSync(subPath);
 
-        if (!jobs[jobId]) return;
+        const job = jobs[jobId];
+        if (!job) return;
 
         if (code === 0) {
-            jobs[jobId].status = 'done';
-            jobs[jobId].progress = 100;
+            job.status = 'done';
+            job.progress = 100;
+            job.currentTimeStr = job.totalDurationStr;
+            job.eta = '0 detik (Selesai)';
+            job.log = '✅ Proses penggabungan subtitle selesai 100%!';
         } else {
-            jobs[jobId].status = 'error';
-            jobs[jobId].error = 'Gagal memproses video. Pastikan file subtitle (.srt) valid.';
+            job.status = 'error';
+            job.error = 'Gagal memproses video. Pastikan file subtitle (.srt) memiliki format yang benar.';
         }
     });
 
-    // Langsung balas dengan jobId agar browser tidak terkena Timeout
     res.json({ jobId });
 });
 
-// 2. Endpoint Cek Progress
+// 2. Endpoint Polling Status Detail
 app.get('/status/:jobId', (req, res) => {
     const job = jobs[req.params.jobId];
     if (!job) return res.status(404).json({ error: 'Proses tidak ditemukan.' });
-    res.json({ status: job.status, progress: job.progress, error: job.error });
+
+    res.json({
+        status: job.status,
+        mode: job.mode,
+        progress: job.progress,
+        currentTimeStr: job.currentTimeStr,
+        totalDurationStr: job.totalDurationStr,
+        fps: job.fps,
+        speed: job.speed,
+        eta: job.eta,
+        log: job.log,
+        error: job.error
+    });
 });
 
 // 3. Endpoint Unduh Hasil Video
@@ -133,29 +197,37 @@ app.get('/download/:jobId', (req, res) => {
     const jobId = req.params.jobId;
     const job = jobs[jobId];
     if (!job || job.status !== 'done' || !fs.existsSync(job.outputPath)) {
-        return res.status(404).send('File tidak ditemukan atau sudah kedaluwarsa.');
+        return res.status(404).send('File tidak ditemukan atau sudah terhapus.');
     }
 
-    res.download(job.outputPath, job.outputFileName, () => {
-        if (fs.existsSync(job.outputPath)) fs.unlinkSync(job.outputPath);
-        delete jobs[jobId];
+    const stat = fs.statSync(job.outputPath);
+    res.setHeader('Content-Length', stat.size);
+    res.setHeader('Content-Type', 'video/mp4');
+    res.setHeader('Content-Disposition', `attachment; filename="${job.outputFileName}"`);
+
+    const fileStream = fs.createReadStream(job.outputPath);
+    fileStream.pipe(res);
+
+    // Hapus file 5 menit setelah diunduh agar user masih bisa klik "Unduh Ulang" jika perlu
+    fileStream.on('close', () => {
+        setTimeout(() => {
+            if (fs.existsSync(job.outputPath)) fs.unlinkSync(job.outputPath);
+            delete jobs[jobId];
+        }, 5 * 60 * 1000);
     });
 });
 
-// Auto-Cleanup: Bersihkan file yang berumur lebih dari 30 menit setiap 15 menit
+// Auto-Cleanup setiap 15 menit untuk file yang berumur > 30 menit
 setInterval(() => {
     const now = Date.now();
     const maxAge = 30 * 60 * 1000;
-
     [uploadDir, outputDir].forEach(dir => {
         fs.readdir(dir, (err, files) => {
             if (err) return;
             files.forEach(file => {
                 const filePath = path.join(dir, file);
                 fs.stat(filePath, (err, stats) => {
-                    if (!err && now - stats.mtimeMs > maxAge) {
-                        fs.unlink(filePath, () => {});
-                    }
+                    if (!err && now - stats.mtimeMs > maxAge) fs.unlink(filePath, () => {});
                 });
             });
         });
@@ -163,5 +235,5 @@ setInterval(() => {
 }, 15 * 60 * 1000);
 
 app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Server Production berjalan di port ${PORT}`);
+    console.log(`Server berjalan di http://localhost:${PORT}`);
 });
